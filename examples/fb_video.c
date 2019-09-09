@@ -18,11 +18,15 @@
 #define LEP_WIDTH 160
 #define LEP_HEIGHT 120
 
+/* Screen resolution */
+#define FB_WIDTH  800
+#define FB_HEIGHT 600
+
 /* Faux-AGC parameters */
 #define MIN_AGC_RANGE 200
 
 // The size of the circular frame buffer
-#define FRAME_BUF_SIZE 8
+#define FRAME_BUF_SIZE 2
 
 // Positions of the reader and writer in the frame buffer
 int reader = 0, writer = 0;
@@ -36,120 +40,60 @@ pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 // The frame buffer
 vospi_frame_t* frame_buf[FRAME_BUF_SIZE];
 
-/**
- * Read frames from the device into the circular buffer.
- */
-void* get_frames_from_device(void* spidev_path_ptr)
+// Framebuffer info
+struct fb_var_screeninfo v_info;
+struct fb_fix_screeninfo f_info;
+long int screen_size = 0;
+long int line_length = 0;
+int fb_fd;
+char *fb_ptr;
+
+// SPI device
+int spi_fd;
+
+// Frame
+vospi_frame_t frame;
+
+int init_fb(void)
 {
-    char* spidev_path = (char*)spidev_path_ptr;
-    int spi_fd;
-
-    // Declare a static frame to use as a scratch space to avoid locking the framebuffer while
-    // we're waiting for a new frame
-    vospi_frame_t frame;
-
-    // Initialise the segments
-    for (int seg = 0; seg < VOSPI_SEGMENTS_PER_FRAME; seg ++) {
-      frame.segments[seg].packet_count = VOSPI_PACKETS_PER_SEGMENT_NORMAL;
-    }
-
-    // Open the spidev device
-    log_info("opening SPI device... %s", spidev_path);
-    if ((spi_fd = open(spidev_path, O_RDWR)) < 0) {
-      log_fatal("SPI: failed to open device - check permissions & spidev enabled");
-      exit(-1);
-    }
-
-    // Initialise the VoSPI interface
-    if (vospi_init(spi_fd, 20000000) == -1) {
-        log_fatal("SPI: failed to condition SPI device for VoSPI use.");
-        exit(-1);
-    }
-
-    // Synchronise, then receive frames forever
-    do {
-
-      log_info("aquiring VoSPI synchronisation");
-
-      if (0 == sync_and_transfer_frame(spi_fd, &frame)) {
-        log_error("failed to obtain frame from device.");
-        exit(-10);
-      }
-
-      log_info("VoSPI stream synchronised");
-
-      do {
-
-          if (!transfer_frame(spi_fd, &frame)) {
-            break;
-          }
-
-          pthread_mutex_lock(&lock);
-
-          // Copy the newly-received frame into place
-          memcpy(frame_buf[writer], &frame, sizeof(vospi_frame_t));
-
-          // Move the writer ahead
-          writer = (writer + 1) & (FRAME_BUF_SIZE - 1);
-
-          // Unlock and post the space semaphore
-          pthread_mutex_unlock(&lock);
-          sem_post(&count_sem);
-
-      } while (1); // While synchronised
-    } while (1);  // Forever
-
-}
-
-/**
- * Draw frames to the framebuffer as they become available.
- */
-void* draw_frames_to_fb(void* fb_dev_path_ptr)
-{
-    char* fb_dev_path = (char*)fb_dev_path_ptr;
-    struct fb_var_screeninfo v_info;
-    struct fb_fix_screeninfo f_info;
-    long int screen_size = 0;
-    long int line_length = 0;
-    int fb_fd;
-    char *fb_ptr;
+    char* fb_dev_path = "/dev/fb0";
 
     // Open the framebuffer and obtain some information about it
     fb_fd = open(fb_dev_path, O_RDWR);
     if (!fb_fd) {
       log_error("cannot open framebuffer device.");
-      return NULL;
+      return 0;
     }
 
     // Get fixed screen information
     if (ioctl(fb_fd, FBIOGET_FSCREENINFO, &f_info)) {
       log_error("cannot read fb fixed information.");
-      return NULL;
+      return 0;
     }
     // Get variable screen information
     if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &v_info)) {
       log_error("cannot read fb variable information.");
-      return NULL;
+      return 0;
     }
 
     // Change variable info
-    v_info.bits_per_pixel = 24;
-    v_info.xres = LEP_WIDTH;
-    v_info.yres = LEP_HEIGHT;
+    v_info.bits_per_pixel = 32;
+    v_info.xres = FB_WIDTH;
+    v_info.yres = FB_HEIGHT;
     if (ioctl(fb_fd, FBIOPUT_VSCREENINFO, &v_info)) {
       log_error("cannot write fb variable information.");
-      return NULL;
+      return 0;
     }
 
     // Get variable screen information
     if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &v_info)) {
       log_error("cannot re-read fb variable information.");
-      return NULL;
+      return 0;
     }
     // Get fixed screen information
     if (ioctl(fb_fd, FBIOGET_FSCREENINFO, &f_info)) {
       log_error("cannot re-read fb fixed information.");
-      return NULL;
+      return 0;
     }
 
     // Capture linear display size
@@ -168,7 +112,73 @@ void* draw_frames_to_fb(void* fb_dev_path_ptr)
       log_error("couldn't mmap the framebuffer");
       exit(1);
     }
+    return 1;
+}
 
+void frame_init()
+{
+  // Initialise the segments
+  for (int seg = 0; seg < VOSPI_SEGMENTS_PER_FRAME; seg ++) {
+    frame.segments[seg].packet_count = VOSPI_PACKETS_PER_SEGMENT_NORMAL;
+  }
+
+  // Open the spidev device
+  log_info("opening SPI device... %s", "/dev/spidev0.0");
+  if ((spi_fd = open("/dev/spidev0.0", O_RDWR)) < 0) {
+    log_fatal("SPI: failed to open device - check permissions & spidev enabled");
+    exit(-1);
+  }
+
+  // Initialise the VoSPI interface
+  if (vospi_init(spi_fd, 20000000) == -1) {
+      log_fatal("SPI: failed to condition SPI device for VoSPI use.");
+      exit(-1);
+  }
+}
+
+/**
+ * Read frames from the device into the circular buffer.
+ */
+void* get_frames_from_device()
+{
+    // Synchronise, then receive frames forever
+    do {
+
+      log_info("aquiring VoSPI synchronisation");
+
+      if (0 == sync_and_transfer_frame(spi_fd, &frame)) {
+        log_error("failed to obtain frame from device.");
+        exit(-10);
+      }
+
+      log_info("VoSPI stream synchronised");
+
+      do {
+          if (!transfer_frame(spi_fd, &frame)) {
+            break;
+          }
+
+          pthread_mutex_lock(&lock);
+
+          // Copy the newly-received frame into place
+          memcpy(frame_buf[writer], &frame, sizeof(vospi_frame_t));
+
+          // Move the writer ahead
+          writer = (writer + 1) & (FRAME_BUF_SIZE - 1);
+
+          // Unlock and post the space semaphore
+          pthread_mutex_unlock(&lock);
+          sem_post(&count_sem);
+
+      } while (1); // While synchronised
+    } while (1);  // Forever
+}
+
+/**
+ * Draw frames to the framebuffer as they become available.
+ */
+void* draw_frames_to_fb()
+{
     // Declare a frame on the stack to copy data into and use to render from
     vospi_frame_t next_frame;
 
@@ -228,17 +238,25 @@ void* draw_frames_to_fb(void* fb_dev_path_ptr)
 
       // Draw the frame to the fb
       uint16_t fb_offset = 0;
-      for (int line = 0; line < LEP_HEIGHT; line ++) {
-        for(int col = 0; col < LEP_WIDTH; col ++) {
-          fb_ptr[line_length * line + (col * 3)] = fc_map[pix_values[fb_offset]][2];
-          fb_ptr[line_length * line + (col * 3) + 1] = fc_map[pix_values[fb_offset]][1];
-          fb_ptr[line_length * line + (col * 3) + 2] = fc_map[pix_values[fb_offset]][0];
-          fb_offset ++;
+      char pix;
+     
+      for (int line = 0; line < FB_HEIGHT; line ++) {
+        if(line%5 != 0)
+          fb_offset -= LEP_WIDTH;
+        
+        for(int col = 0; col < FB_WIDTH; col ++) {
+          if(col%5 == 0) {
+            pix = pix_values[fb_offset];
+            fb_offset ++;
+          }
+          
+          fb_ptr[line_length * line + (col * 4)] = pix;
+          fb_ptr[line_length * line + (col * 4) + 1] = pix;
+          fb_ptr[line_length * line + (col * 4) + 2] = pix;
+          fb_ptr[line_length * line + (col * 4) + 3] = 0;
         }
       }
     }
-
-    munmap(fb_ptr, screen_size);
 }
 
 /**
@@ -254,12 +272,6 @@ int main(int argc, char *argv[])
   // Setup semaphores
   sem_init(&count_sem, 0, 0);
 
-  // Check we have enough arguments to work
-  if (argc < 2) {
-    log_error("Can't start - SPI device file path must be specified.");
-    exit(-1);
-  }
-
   // Allocate space to receive the segments in the circular buffer
   log_info("preallocating space for segments...");
   for (int frame = 0; frame < FRAME_BUF_SIZE; frame ++) {
@@ -269,14 +281,20 @@ int main(int argc, char *argv[])
     }
   }
 
+  // Initialize the framebuffer
+  init_fb();
+  
+  // Init SPI etc
+  frame_init();
+
   log_info("Creating get_frames_from_device_thread thread");
-  if (pthread_create(&get_frames_thread, NULL, get_frames_from_device, argv[1])) {
+  if (pthread_create(&get_frames_thread, NULL, get_frames_from_device, NULL)) {
     log_fatal("Error creating get_frames_from_device thread");
     return 1;
   }
 
   log_info("Creating draw_frames_to_fb_thread thread");
-  if (pthread_create(&draw_frames_to_fb_thread, NULL, draw_frames_to_fb, "/dev/fb0")) {
+  if (pthread_create(&draw_frames_to_fb_thread, NULL, draw_frames_to_fb, NULL)) {
     log_fatal("Error creating draw_frames_to_fb_thread thread");
     return 1;
   }
